@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PostgreSQL 备份试恢复验证</title>
+<style>
+:root{--blue:#2563eb;--green:#16a34a;--red:#dc2626;--orange:#d97706;--gray:#6b7280}
+*{box-sizing:border-box}
+body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f3f4f6;color:#111827}
+header{background:#1f2937;color:#fff;padding:14px 24px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0}
+#slots{font-size:14px;background:#374151;padding:4px 12px;border-radius:999px;white-space:nowrap}
+header .hint{color:#9ca3af;font-size:13px}
+main{max-width:960px;margin:24px auto;padding:0 16px}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:16px 20px;margin-bottom:16px}
+.card h2{margin:0 0 12px;font-size:16px}
+button{cursor:pointer;border:0;border-radius:8px;padding:8px 14px;font-size:14px;background:var(--blue);color:#fff}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.ghost{background:#e5e7eb;color:#111827;text-align:left}
+button.danger{background:var(--red)}
+#msg{margin-top:10px;font-size:14px;min-height:20px}
+#msg.error{color:var(--red)}#msg.ok{color:var(--green)}
+.badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;color:#fff}
+.st-queued{background:#6b7280}.st-running{background:#2563eb}.st-cancelling{background:#d97706}
+.st-succeeded{background:#16a34a}.st-failed{background:#dc2626}.st-cancelled{background:#9ca3af}.st-interrupted{background:#4b5563}
+.job{border-top:1px solid #e5e7eb;padding:12px 0}
+.job:first-child{border-top:0;padding-top:0}
+.job-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.job-head .fname{font-weight:600;word-break:break-all}
+.meta{color:#6b7280;font-size:12px;margin-top:4px}
+.meta code{background:#f3f4f6;padding:1px 5px;border-radius:4px}
+table.rows{border-collapse:collapse;margin-top:8px;font-size:13px}
+table.rows th,table.rows td{border:1px solid #e5e7eb;padding:4px 10px;text-align:left}
+table.rows th{background:#f9fafb}
+pre.errors{background:#111827;color:#fca5a5;padding:10px;border-radius:8px;overflow:auto;max-height:260px;font-size:12px;margin-top:8px;white-space:pre-wrap}
+.skipped{font-size:13px;color:#92400e;margin-top:6px}
+.jobmsg{font-size:13px;margin-top:6px;color:#374151}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.sample-btn{display:flex;flex-direction:column;align-items:flex-start;gap:2px;line-height:1.4}
+.sample-btn small{font-weight:400;opacity:.8}
+.hint{color:#6b7280;font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>PostgreSQL 备份试恢复验证</h1>
+  <span id="slots">名额：…</span>
+  <span class="hint">上传 pg_dump 自定义格式备份，在独立临时库实际恢复并核对各表行数（仅普通表及其索引、约束，不含扩展）</span>
+</header>
+<main>
+  <div class="card">
+    <h2>发起试恢复</h2>
+    <div class="row">
+      <input type="file" id="file">
+      <button id="uploadBtn">上传并试恢复</button>
+    </div>
+    <div style="margin:14px 0 6px" class="hint">或使用内置示例备份：</div>
+    <div class="row" id="samples">加载中…</div>
+    <div id="msg"></div>
+  </div>
+  <div class="card">
+    <h2>试恢复批次（最多两批并行）</h2>
+    <div id="jobs"><span class="hint">暂无批次</span></div>
+  </div>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATE = {queued:['排队中','st-queued'],running:['试恢复中','st-running'],cancelling:['取消中·清理中','st-cancelling'],
+  succeeded:['成功','st-succeeded'],failed:['失败','st-failed'],cancelled:['已取消','st-cancelled'],interrupted:['已中断(重启)','st-interrupted']};
+const fmtSize = n => n<1024 ? n+' B' : n<1048576 ? (n/1024).toFixed(1)+' KiB' : (n/1048576).toFixed(1)+' MiB';
+const fmtT = ts => ts ? new Date(ts*1000).toLocaleString() : '-';
+const fmtDur = j => { if(!j.started_at) return '-'; const e=(j.finished_at||Date.now()/1000)-j.started_at; return e.toFixed(1)+' s'; };
+
+async function refresh(){
+  try{
+    const r = await fetch('/api/jobs');
+    const d = await r.json();
+    $('#slots').textContent = `并行名额：${d.slots.in_use} / ${d.slots.total} 使用中`;
+    renderJobs(d.jobs);
+  }catch(e){ /* keep previous view on transient errors */ }
+}
+
+function renderJobs(jobs){
+  const box = $('#jobs');
+  if(!jobs.length){ box.innerHTML='<span class="hint">暂无批次</span>'; return; }
+  box.innerHTML = jobs.map(j=>{
+    const [label, cls] = STATE[j.state]||[j.state,'st-queued'];
+    const active = (j.state==='queued'||j.state==='running');
+    let html = `<div class="job"><div class="job-head">
+      <span class="fname">${esc(j.filename)}</span>
+      <span class="badge ${cls}">${label}</span>
+      ${active?`<button class="danger" onclick="cancelJob('${j.id}')">取消</button>`:''}
+      </div>
+      <div class="meta">大小 ${fmtSize(j.size)} ｜ 提交 ${fmtT(j.created_at)} ｜ 耗时 ${fmtDur(j)}
+      ｜ 临时库 <code>${esc(j.temp_db||'-')}</code> ｜ ID <code>${j.id.slice(0,8)}</code></div>`;
+    if(j.message) html += `<div class="jobmsg">${esc(j.message)}</div>`;
+    if(j.skipped && Object.keys(j.skipped).length){
+      html += `<div class="skipped">已跳过不支持的对象：${Object.entries(j.skipped).map(([k,v])=>esc(k)+' × '+v).join('，')}</div>`;
+    }
+    if(j.row_counts && j.row_counts.length){
+      const total = j.row_counts.reduce((a,b)=>a+b.rows,0);
+      html += `<table class="rows"><tr><th>模式</th><th>表</th><th>行数</th></tr>` +
+        j.row_counts.map(r=>`<tr><td>${esc(r.schema)}</td><td>${esc(r.table)}</td><td>${r.rows.toLocaleString()}</td></tr>`).join('') +
+        `<tr><th colspan="2">合计</th><th>${total.toLocaleString()}</th></tr></table>`;
+    }
+    if(j.errors && j.errors.length){
+      html += `<pre class="errors">${esc(j.errors.join('\n'))}</pre>`;
+    }
+    return html + '</div>';
+  }).join('');
+}
+
+async function upload(){
+  const f = $('#file').files[0];
+  if(!f){ showMsg('请先选择备份文件', true); return; }
+  const fd = new FormData(); fd.append('file', f);
+  showMsg('上传中…');
+  try{
+    const r = await fetch('/api/jobs', {method:'POST', body:fd});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){ showMsg(d.detail||('失败：'+r.status), true); return; }
+    showMsg('已受理，开始试恢复'); $('#file').value=''; refresh();
+  }catch(e){ showMsg('上传失败：'+e, true); }
+}
+
+async function startSample(name){
+  showMsg('提交示例备份…');
+  const r = await fetch('/api/jobs/sample/'+name, {method:'POST'});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ showMsg(d.detail||('失败：'+r.status), true); return; }
+  showMsg('已受理，开始试恢复'); refresh();
+}
+
+async function cancelJob(id){
+  const r = await fetch('/api/jobs/'+id+'/cancel', {method:'POST'});
+  if(!r.ok){ const d=await r.json().catch(()=>({})); showMsg(d.detail||'取消失败', true); return; }
+  showMsg('取消已受理，正在清理…'); refresh();
+}
+
+async function loadSamples(){
+  try{
+    const r = await fetch('/api/samples');
+    const list = await r.json();
+    $('#samples').innerHTML = list.length ? list.map(s=>
+      `<button class="ghost sample-btn" onclick="startSample('${esc(s.name)}')"><b>${esc(s.name)}.dump</b><small>${esc(s.description)}（${fmtSize(s.size)}）</small></button>`
+    ).join('') : '<span class="hint">示例尚未生成（seed 容器运行后会出现在这里）</span>';
+  }catch(e){ $('#samples').innerHTML='<span class="hint">示例加载失败</span>'; }
+}
+
+function showMsg(t, isErr){ const m=$('#msg'); m.textContent=t; m.className=isErr?'error':'ok'; }
+$('#uploadBtn').addEventListener('click', upload);
+loadSamples(); refresh(); setInterval(refresh, 1500);
+</script>
+</body>
+</html>
